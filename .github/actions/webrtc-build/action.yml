@@ -1,0 +1,143 @@
+name: 'Build libraries'
+description: 'Full pipeline to build WebRTC static libraries'
+inputs:
+  src_dir:
+    description: 'Source directory'
+    required: true
+  gn_args:
+    description: 'Build arguments'
+    required: true
+  white_lib_list:
+    description: 'Which libraries package to library'
+    required: false
+    default: 'webrtc boringssl protobuf_lite field_trial_default metrics_default'
+  black_header_list:
+    description: 'Which headers exclude from library'
+    required: false
+    default: 'examples test build sdk'
+  build_dir:
+    description: 'Build directory'
+    required: false
+    default: 'out/ninja'
+  package_dir:
+    description: 'Package directory'
+    required: false
+    default: 'out/package'
+outputs:
+  package_dir:
+    description: "Package path"
+    value: ${{ steps.package.outputs.dir }}
+runs:
+  using: "composite"
+  steps:
+
+    - name: Generate build environments
+      shell: bash
+      working-directory: ${{ inputs.src_dir }}
+      run: gn gen ${{ inputs.build_dir }} --args="${{ inputs.gn_args }}"
+
+    - name: Show build arguments
+      shell: bash
+      working-directory: ${{ inputs.src_dir }}
+      run: gn args ${{ inputs.build_dir }} --list
+
+    - name: Build
+      shell: bash
+      working-directory: ${{ inputs.src_dir }}
+      run: ninja -v -C ${{ inputs.build_dir }} webrtc
+
+    - name: Package libraries to single file
+      shell: bash
+      working-directory: ${{ inputs.src_dir }}
+      env:
+        PACKAGE_NAME: webrtc
+      run: |
+        # set -x
+        WORKING_DIR=${PWD}
+        cd ${{ inputs.build_dir }}
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          LIB_EXT=lib
+        else
+          LIB_EXT=a
+        fi
+        find . -name *.${LIB_EXT} # debug
+        # Add build directory to list
+        WHITE_LIB_LIST="${{ inputs.white_lib_list }} ${{ inputs.build_dir }}"
+        # Replace delimiters and add file extension 
+        WHITE_LIB_LIST=$(echo ${WHITE_LIB_LIST}\\.${LIB_EXT} | sed "s/ /\\\\.${LIB_EXT}|/g")
+        # Set library name
+        LIB_NAME=lib${{ env.PACKAGE_NAME }}.${LIB_EXT}
+        # Get all libraries that should pack
+        LIBS=$(cat .ninja_log | tr '\t' '\n' | grep -E "^obj/" | grep -E ${WHITE_LIB_LIST} | sort -u)
+        # Combine all objects to static library
+        case $RUNNER_OS in
+        Windows)
+          # https://docs.microsoft.com/en-us/cpp/build/reference/overview-of-lib?view=msvc-160
+          echo $LIBS | tr ' ' '\n' > ${LIB_NAME}.list
+          lib.exe /OUT:${LIB_NAME} @${LIB_NAME}.list
+          ;;
+        macOS)
+          # https://www.unix.com/man-page/osx/1/libtool/
+          libtool -static -o ${LIB_NAME} $LIBS
+          ;;
+        *)
+          # https://linux.die.net/man/1/ar + https://man7.org/linux/man-pages/man1/ranlib.1.html
+          echo "CREATE ${LIB_NAME}" > ${LIB_NAME}.ar
+          for lib in $LIBS
+          do
+            echo "ADDLIB ${lib}" >> ${LIB_NAME}.ar
+          done
+          echo "SAVE" >> ${LIB_NAME}.ar
+          echo "END" >> ${LIB_NAME}.ar
+          ar -M < ${LIB_NAME}.ar
+          ranlib ${LIB_NAME}
+          ;;
+        esac
+        # move library to build directory
+        mkdir -p ${WORKING_DIR}/${{ inputs.package_dir }}/lib
+        mv ${LIB_NAME} ${WORKING_DIR}/${{ inputs.package_dir }}/lib
+        if [ -d "WebRTC.dSYM" ]; then
+          # xcodebuild -create-xcframework \
+          #   -framework WebRTC.framework -debug-symbols WebRTC.dSYM \
+          #   -output libwebrtc.xcframework
+          # mv libwebrtc.xcframework ${WORKING_DIR}/${{ inputs.package_dir }}/lib
+          mv WebRTC.dSYM ${WORKING_DIR}/${{ inputs.package_dir }}/lib
+          # mv WebRTC.framework ${WORKING_DIR}/${{ inputs.package_dir }}/lib
+        fi
+
+    - name: Clean disk space
+      shell: bash
+      working-directory: ${{ inputs.src_dir }}
+      run: rm -rf  ${{ inputs.build_dir }}
+
+    - name: Copy headers
+      shell: bash
+      working-directory: ${{ inputs.src_dir }}
+      run: |
+        # set -x
+        mkdir -p ${{ inputs.package_dir }}/include
+        # Add build directory to list
+        BLACK_INCLUDE_LIST="${{ inputs.black_header_list }} ${BLACK_INCLUDE_LIST}"
+        # create exclude directories list
+        for dir in ${BLACK_INCLUDE_LIST}
+        do
+          EXCLUDE="$EXCLUDE -path ./${dir} -prune -o"
+        done
+        # add support to recursive copy in mac
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          which gcp || brew install coreutils
+          CP='gcp'
+        else
+          CP='cp'
+        fi
+        # copy headers license and copying files
+        find . $EXCLUDE -type f -a \( -name "*.h" -o -name LICENSE -o -name COPYING \) -print | \
+          xargs -I '{}' $CP --parents '{}' ${{ inputs.package_dir }}/include
+
+    - name: Set outputs
+      shell: bash
+      working-directory: ${{ inputs.src_dir }}
+      id: package
+      run: |
+        cd ${{ inputs.package_dir }}
+        echo "::set-output name=dir::${PWD}"

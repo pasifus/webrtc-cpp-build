@@ -1,0 +1,264 @@
+# https://www.chromium.org/developers/how-tos/get-the-code
+
+name: CI
+on:
+  push:
+    branches:
+      - "*"
+  release:
+    types: 
+      - published
+      
+env:
+  WEBRTC_GIT: https://chromium.googlesource.com/external/webrtc
+  WEBRTC_BRANCH: branch-heads/4515 # https://chromiumdash.appspot.com/branches
+
+jobs:
+  config:
+    name: "Get git revision"
+    runs-on: "ubuntu-20.04"
+    outputs:
+      revision: ${{ steps.config.outputs.revision }}
+      package_version: ${{ steps.config.outputs.package_version }}
+      package_channel: ${{ steps.config.outputs.package_channel }}
+      package_upload: ${{ steps.config.outputs.package_upload }}
+    steps:
+      - name: Get webrtc revision, package version and channel
+        id: config
+        shell: bash
+        run: |
+          # revision
+          REVISION=$(git ls-remote $WEBRTC_GIT --heads $WEBRTC_BRANCH | head -n 1 | cut -f 1)
+          REVISION_SHORT=${REVISION:0:6}
+          echo "Branch: $WEBRTC_BRANCH"
+          echo "Revision: ${REVISION}"
+          echo "::set-output name=revision::${REVISION}"
+          # version
+          if [ "${{ github.event.release.tag_name }}" == "" ]; then
+            PACKAGE_VERSION=${REVISION_SHORT}
+            PACKAGE_CHANNEL=test
+            PACKAGE_UPLOAD=false
+          else
+            PACKAGE_VERSION=${{ github.event.release.tag_name }}
+            PACKAGE_CHANNEL=stable
+            PACKAGE_UPLOAD=true
+          fi
+          echo "Package version: $PACKAGE_VERSION"
+          echo "Package channel: ${PACKAGE_CHANNEL}"
+          echo "Package upload URL: ${PACKAGE_UPLOAD}"
+          echo ::set-output name=package_version::${PACKAGE_VERSION}
+          echo ::set-output name=package_channel::${PACKAGE_CHANNEL}
+          echo ::set-output name=package_upload::${PACKAGE_UPLOAD}
+
+  build:
+    name: "Build"
+    needs: config
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows
+          - os: windows-2019
+            target_os: win
+            arch: x64
+            gn_args: is_clang=false enable_iterator_debugging=true
+            gclient_target_os: '["win"]'
+            msvc_arch: amd64_x86
+            compile: msvc
+            conan_args: -s arch=x86_64 -s arch_build=x86_64 -s compiler="Visual Studio" -s compiler.version=16
+          # Linux
+          - os: ubuntu-20.04
+            target_os: linux
+            arch: x64
+            gn_args: is_clang=false use_custom_libcxx=false
+            gclient_target_os: '["linux"]'
+            compile: gnu
+            conan_args: -s arch=x86_64 -s arch_build=x86_64 -s compiler="gcc" -s compiler.libcxx=libstdc++11 -e CC=/usr/bin/gcc -e CXX=/usr/bin/g++
+          # MacOS
+          - os: macOS-11
+            target_os: mac
+            arch: x64
+            gn_args: is_clang=true use_custom_libcxx=false enable_dsyms=true
+            gclient_target_os: '["mac"]'
+            compile: clang
+            conan_args: -s arch=x86_64 -s arch_build=x86_64 -s compiler="apple-clang" -s compiler.libcxx=libc++ -e CC=/usr/bin/clang -e CXX=/usr/bin/clang++
+          - os: macOS-11
+            target_os: mac
+            arch: arm64
+            gn_args: is_clang=true use_custom_libcxx=false enable_dsyms=true
+            gclient_target_os: '["mac"]'
+            compile: clang
+            conan_args: -s arch=armv8 -s arch_build=armv8 -s compiler="apple-clang" -s compiler.libcxx=libc++ -e CC=/usr/bin/clang -e CXX=/usr/bin/clang++
+          # iOS
+          - os: macOS-11
+            target_os: ios
+            arch: x64
+            gn_args: is_clang=true use_custom_libcxx=false enable_dsyms=true ios_enable_code_signing=false
+            gclient_target_os: '["mac", "ios"]'
+            compile: clang
+            conan_args: -s os=iOS -s os.version=12.0 -s arch=x86_64 -s arch_build=x86_64 -s compiler="apple-clang" -s compiler.libcxx=libc++ -e CC=/usr/bin/clang -e CXX=/usr/bin/clang++
+          - os: macOS-11
+            target_os: ios
+            arch: arm64
+            gn_args: is_clang=true use_custom_libcxx=false enable_dsyms=true ios_enable_code_signing=false
+            gclient_target_os: '["mac", "ios"]'
+            compile: clang
+            conan_args: -s os=iOS -s os.version=12.0 -s arch=armv8 -s arch_build=armv8 -s compiler="apple-clang" -s compiler.libcxx=libc++ -e CC=/usr/bin/clang -e CXX=/usr/bin/clang++
+
+    env:
+      MSVC_PATH: 'C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC'
+      DEPOT_TOOLS_PATH: ${{ github.workspace }}/depot_tools
+      DEPOT_TOOLS_WIN_TOOLCHAIN: 0
+      GN_DEFAULT_ARGS: 'is_component_build=false rtc_include_tests=false treat_warnings_as_errors=false rtc_build_examples=false use_rtti=true target_os=\"${{ matrix.target_os }}\" target_cpu=\"${{ matrix.arch }}\" ${{ matrix.gn_args }}'
+      GN_release_ARGS: 'is_debug=false strip_debug_info=true symbol_level=0'
+      WHITE_LIB_LIST: "boringssl protobuf_lite field_trial_default metrics_default"
+      BLACK_INCLUDE_LIST: "examples test build sdk"
+      CONAN_UPLOAD_USER: ${{ secrets.CONAN_UPLOAD_USER }}
+      CONAN_UPLOAD_PASSWORD: ${{ secrets.CONAN_UPLOAD_PASSWORD }}
+      CONAN_UPLOAD_URL: ${{ secrets.CONAN_UPLOAD_URL }}
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      # https://docs.microsoft.com/en-us/cpp/build/building-on-the-command-line?view=msvc-160
+      - name: Setup MSVC environment
+        if: "${{ matrix.target_os == 'win' }}"
+        shell: bash
+        run: |
+          '${{ env.MSVC_PATH }}\Auxiliary\Build\vcvarsall.bat' ${{ matrix.msvc_arch }}
+          MSVC_TOOLS=$(find '${{ env.MSVC_PATH }}\Tools\MSVC' -maxdepth 1 -type d | sort -r | head -n 1)
+          echo ${MSVC_TOOLS}'\bin\Hostx64\x64\' >> $GITHUB_PATH
+          
+      - name: Install linux dependencies
+        if: "${{ matrix.target_os == 'linux' }}"
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get install -y clang libc++-dev libc++abi-dev
+          sudo apt-get install -y gcc gcc-multilib g++ g++-multilib
+          sudo apt-get install -y libasound2-dev libpulse-dev libxdamage-dev libxrandr-dev libxtst-dev libxcomposite-dev 
+
+      - name: Install depot_tools
+        shell: bash
+        run: |
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git $DEPOT_TOOLS_PATH
+          echo $DEPOT_TOOLS_PATH >> $GITHUB_PATH
+
+      # https://chromium.googlesource.com/external/webrtc/+/master/DEPS
+      - name: Setup gclient build config
+        shell: bash
+        run: |
+          echo 'target_os = ${{ matrix.gclient_target_os }}' >> .gclient
+
+      - name: Checkout webrtc and run hooks
+        shell: bash
+        run: |
+          gclient sync --no_bootstrap --shallow --no-history -vv --revision ${{ needs.config.outputs.revision }}
+          
+      - name: Patch webrtc (fix dynamic CRT on Windows)
+        if: "${{ matrix.target_os == 'win' }}"
+        shell: bash
+        run: |
+          # sed windows style
+          sed -i 's|:static_crt|:dynamic_crt|' src/build/config/win/BUILD.gn
+          cat src/build/config/win/BUILD.gn
+
+      # - name: Setup TMATE Session
+      #   uses: mxschmitt/action-tmate@v3.6
+
+      # Release
+      - name: Build library [Release]
+        id: build-release
+        uses: ./.github/actions/webrtc-build
+        with:
+          src_dir: src
+          gn_args: ${{ env.GN_DEFAULT_ARGS }} ${{ env.GN_release_ARGS }}
+
+      - name: Conan pack [Release]
+        uses: ./.github/actions/conan-pack
+        with:
+          package_dir: ${{ steps.build-release.outputs.package_dir }}
+          conan_args: ${{ matrix.conan_args }} -s build_type=Release
+          package_version: ${{ needs.config.outputs.package_version }}
+          package_user: ${{ github.repository_owner }}
+          package_channel: ${{ needs.config.outputs.package_channel }}
+          upload: ${{ needs.config.outputs.package_upload }}
+          upload_user: ${{ env.CONAN_UPLOAD_USER }}
+          upload_password: ${{ env.CONAN_UPLOAD_PASSWORD }}
+          upload_url: ${{ env.CONAN_UPLOAD_URL }}
+
+      - name: Archive [Release]
+        uses: ./.github/actions/zip
+        with:
+          path: ${{ steps.build-release.outputs.package_dir }}
+          filename: webrtc-${{ matrix.target_os }}-${{ matrix.arch }}-${{ matrix.compile }}_release.zip
+
+      - name: Upload to artifact [Release]
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v2
+        with:
+          name: webrtc-${{ matrix.target_os }}-${{ matrix.arch }}-${{ matrix.compile }}_release.zip
+          path: webrtc-${{ matrix.target_os }}-${{ matrix.arch }}-${{ matrix.compile }}_release.zip
+
+      - name: Upload to release [Release]
+        if: "startsWith(github.ref, 'refs/tags/')"
+        uses: softprops/action-gh-release@v1
+        with:
+          files: webrtc-${{ matrix.target_os }}-${{ matrix.arch }}-${{ matrix.compile }}_release.zip
+
+      - name: Clean [Release]
+        shell: bash
+        run: rm -rf ${{ steps.build-release.outputs.package_dir }} *.zip
+
+      # Debug
+      - name: Patch webrtc (fix gcc Debug compile error on Linux)
+        if: "${{ matrix.target_os == 'linux' && matrix.compile == 'gnu' }}"
+        shell: bash
+        run: |
+          sed -i 's/DCHECK_IS_ON() true/DCHECK_IS_ON() false/' src/base/dcheck_is_on.h
+          cat src/base/dcheck_is_on.h
+
+      - name: Build library [Debug]
+        id: build-debug
+        uses: ./.github/actions/webrtc-build
+        with:
+          src_dir: src
+          gn_args: ${{ env.GN_DEFAULT_ARGS }}
+
+      - name: Conan pack [Debug]
+        uses: ./.github/actions/conan-pack
+        with:
+          package_dir: ${{ steps.build-debug.outputs.package_dir }}
+          conan_args: ${{ matrix.conan_args }} -s build_type=Debug
+          package_version: ${{ needs.config.outputs.package_version }}
+          package_user: ${{ github.repository_owner }}
+          package_channel: ${{ needs.config.outputs.package_channel }}
+          upload: ${{ needs.config.outputs.package_upload }}
+          upload_user: ${{ env.CONAN_UPLOAD_USER }}
+          upload_password: ${{ env.CONAN_UPLOAD_PASSWORD }}
+          upload_url: ${{ env.CONAN_UPLOAD_URL }}
+          
+      - name: Archive [Debug]
+        uses: ./.github/actions/zip
+        with:
+          path: ${{ steps.build-debug.outputs.package_dir }}
+          filename: webrtc-${{ matrix.target_os }}-${{ matrix.arch }}-${{ matrix.compile }}_debug.zip
+
+      - name: Upload to artifact [Debug]
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v2
+        with:
+          name: webrtc-${{ matrix.target_os }}-${{ matrix.arch }}-${{ matrix.compile }}_debug.zip
+          path: webrtc-${{ matrix.target_os }}-${{ matrix.arch }}-${{ matrix.compile }}_debug.zip
+
+      - name: Upload to release [Debug]
+        if: "startsWith(github.ref, 'refs/tags/')"
+        uses: softprops/action-gh-release@v1
+        with:
+          files: webrtc-${{ matrix.target_os }}-${{ matrix.arch }}-${{ matrix.compile }}_debug.zip
+      
+      - name: Clean [Debug]
+        shell: bash
+        run: rm -rf ${{ steps.build-debug.outputs.package_dir }} *.zip

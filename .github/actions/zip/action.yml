@@ -1,0 +1,25 @@
+name: 'Zip archive'
+description: 'Archive data using zip'
+inputs:
+  path:
+    description: 'Path to the files or directory that should be archived'
+    required: true
+  filename:
+    description: 'Filename for the archive'
+    required: true
+runs:
+  using: "composite"
+  steps:
+        
+    - name: Archive
+      shell: bash
+      run: |
+        set -x
+        WORKING_DIR=${PWD}
+        cd ${{ inputs.path }}
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          7z a -tzip -r ${{ inputs.filename }} *
+        else
+          zip -r ${{ inputs.filename }} *
+        fi
+        mv ${{ inputs.filename }} ${WORKING_DIR}/

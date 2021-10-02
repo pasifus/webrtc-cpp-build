@@ -1,0 +1,85 @@
+name: 'Conan pack'
+description: 'Pack library to conan package manager'
+inputs:
+  package_dir:
+    description: 'Package directory'
+    required: true
+  conan_args:
+    description: 'Build arguments'
+    required: true
+  package_name:
+    description: 'Package name'
+    required: false
+    default: 'webrtc'
+  package_version:
+    description: 'Package version'
+    required: true
+  package_user:
+    description: 'Package user'
+    required: false
+    default: 'user'
+  package_channel:
+    description: 'Package channel'
+    required: false
+    default: 'channel'
+  upload:
+    description: 'Enable upload to remote conan artifactory'
+    required: false
+    default: "false"
+  upload_user:
+    description: 'Username to authenticate'
+    required: false
+    default: ""
+  upload_password:
+    description: 'Password to authenticate'
+    required: false
+    default: ""
+  upload_url:
+    description: 'URL of the remote to upload to'
+    required: false
+    default: ""
+runs:
+  using: "composite"
+  steps:
+
+    - name: Install conan
+      shell: bash
+      run: |
+        if ! [ -x "$(command -v conan)" ]; then
+          echo 'conan is not installed. Installing...'
+          pip3 install wheel setuptools
+          pip3 install conan
+          conan --version
+          conan profile new default --detect
+          conan config set general.revisions_enabled=1
+          echo "${HOME}/.local/bin" >> $GITHUB_PATH
+        fi
+        
+    - name: Create conan package
+      shell: bash
+      working-directory: ${{ inputs.src_dir }}
+      run: |
+        conan create . ${{ inputs.package_name }}/${{ inputs.package_version }}@${{ inputs.package_user }}/${{ inputs.package_channel }} \
+          ${{ inputs.conan_args }} \
+          -o ${{ inputs.package_name }}:build_path=${{ inputs.package_dir }} \
+          --build=missing
+
+    - name: Upload conan package
+      shell: bash
+      working-directory: ${{ inputs.src_dir }}
+      run: |
+        if [ "${{ inputs.upload }}" == "true" ] && [ "${{ inputs.upload_user }}" != "" ] && [ "${{ inputs.upload_password }}" != "" ] && [ "${{ inputs.upload_url }}" != "" ]; then
+          echo "Starting upload..."
+          conan remote add remote-conan ${{ inputs.upload_url }} --force
+          conan user '${{ inputs.upload_user }}' -p '${{ inputs.upload_password }}' -r remote-conan
+          conan upload ${{ inputs.package_name }}/${{ inputs.package_version }}@${{ inputs.package_user }}/${{ inputs.package_channel }} \
+            -r remote-conan \
+            --all
+        else
+          echo "Skip upload"
+        fi
+
+    - name: Remove all conan packages
+      shell: bash
+      working-directory: ${{ inputs.src_dir }}  
+      run: conan remove -f "*"
